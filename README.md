@@ -1,3 +1,5 @@
+Copied from https://github.com/marmotlab/HDPlanner_Exp_and_Nav/tree/main and https://github.com/marmotlab/ARiADNE-ROS-Planner/tree/main
+
 # ARiADNE-ROS-Planner
 
 ARiADNE is **A** **R**e**i**nforcement learning apporach using **A**ttention-based **D**eep **N**etwork.
