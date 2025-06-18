@@ -489,17 +489,6 @@ class QuadNode(object):
 
         return None
 
-    def remove(self, point):
-        found_node, _ = self.find_node(point)
-        if found_node is None:
-            return None
-
-        for pnt in found_node.points:
-            if pnt.x == point.x and pnt.y == point.y:
-                found_node.points.remove(pnt)
-
-        return None
-
     def find_node(self, point, searched=None):
         """
         Searches for the node that would contain the `Point` within the
@@ -685,10 +674,6 @@ class QuadTree(object):
         """
         pnt = self.convert_to_point(point)
         return self._root.find(pnt)
-
-    def remove(self, point):
-        pnt = self.convert_to_point(point)
-        return self._root.remove(pnt)
 
     def within_bb(self, bb):
         """

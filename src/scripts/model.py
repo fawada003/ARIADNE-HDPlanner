@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
+from parameter import *
 
 
 # a pointer network layer for policy output
@@ -205,114 +207,130 @@ class Decoder(nn.Module):
 
 
 class PolicyNet(nn.Module):
-    def __init__(self, node_dim, embedding_dim):
+    def __init__(self, input_dim, embedding_dim):
         super(PolicyNet, self).__init__()
-
-        # graph encoder
-        self.initial_embedding = nn.Linear(node_dim, embedding_dim)
+        self.initial_embedding = nn.Linear(input_dim, embedding_dim) # layer for non-end position
+        self.target_embedding = nn.Linear(embedding_dim * 2, embedding_dim)
+        self.current_embedding2 = nn.Linear(embedding_dim * 3, embedding_dim)
         self.encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=6)
+        self.target_decoder = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
+        self.current_node_decoder2 = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
+        self.pointer1 = SingleHeadAttention(embedding_dim)
+        self.pointer2 = SingleHeadAttention(embedding_dim)
 
-        # decoder
-        self.decoder = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
-        self.current_embedding = nn.Linear(embedding_dim * 2, embedding_dim)
-
-        # pointer
-        self.pointer = SingleHeadAttention(embedding_dim)
-
-    def encode_graph(self, node_inputs, node_padding_mask, edge_mask):
+    def graph_encoder_and_center_decoder(self, node_inputs, node_padding_mask, edge_mask, center_mask, center_index, target_index, current_index, edge_inputs):
+        # encoder
         node_feature = self.initial_embedding(node_inputs)
-        enhanced_node_feature = self.encoder(src=node_feature,
-                                             key_padding_mask=node_padding_mask,
-                                             attn_mask=edge_mask)
-
-        return enhanced_node_feature
-
-    def decode_state(self, enhanced_node_feature, current_index, node_padding_mask):
+        enhanced_node_feature = self.encoder(src=node_feature, key_padding_mask=node_padding_mask, attn_mask=edge_mask)
+        # decoder1 - select center
+        center_index = center_index.permute(0, 2, 1)
         embedding_dim = enhanced_node_feature.size()[2]
-        current_node_feature = torch.gather(enhanced_node_feature, 1,
-                                            current_index.repeat(1, 1, embedding_dim))
-        enhanced_current_node_feature, _ = self.decoder(current_node_feature,
-                                                        enhanced_node_feature,
-                                                        node_padding_mask)
+        target_node_feature = torch.gather(enhanced_node_feature, 1, target_index.repeat(1, 1, embedding_dim))
+        current_node_feature = torch.gather(enhanced_node_feature, 1, current_index.repeat(1, 1, embedding_dim))
+        center_node_features = torch.gather(enhanced_node_feature, 1, center_index.repeat(1, 1, embedding_dim))
 
-        return current_node_feature, enhanced_current_node_feature
+        enhanced_target_node_feature, _ = self.target_decoder(target_node_feature, enhanced_node_feature, node_padding_mask)
+        embedding_target_node_feature = self.target_embedding(torch.cat((enhanced_target_node_feature, target_node_feature), dim=-1))
+        center_logp = self.pointer1(embedding_target_node_feature, center_node_features, center_mask)
+        center_logp = center_logp.squeeze(1) # batch_size*k_size
+        center_logp_index = torch.argmax(center_logp, dim=1).long()
+        selected_center_index = center_index[torch.arange(center_index.size(0)), center_logp_index, :]
+        selected_center_node_feature = center_node_features[torch.arange(center_node_features.size(0)), center_logp_index, :]
+        selected_center_node_feature = selected_center_node_feature.unsqueeze(1)
+        return enhanced_node_feature, current_node_feature, selected_center_index, selected_center_node_feature, center_logp, center_node_features
 
-    def output_policy(self, current_node_feature, enhanced_current_node_feature,
-                      enhanced_node_feature, current_edge, edge_padding_mask):
+    def output_policy(self, enhanced_node_feature, current_node_feature, edge_inputs, edge_padding_mask, selected_center_feature, node_padding_mask):
+        # decoder2 - select next move based on the selected center
+        current_edge = edge_inputs
         embedding_dim = enhanced_node_feature.size()[2]
-        current_state_feature = self.current_embedding(torch.cat((enhanced_current_node_feature,
-                                                                  current_node_feature), dim=-1))
+        if edge_padding_mask is not None:
+            current_mask = edge_padding_mask
+            # print(current_mask)
+        else:
+            current_mask = None
+        current_mask[:,:,0] = 1 # don't stay at current position
+        neighboring_feature = torch.gather(enhanced_node_feature, 1,  current_edge.repeat(1, 1, embedding_dim))
+        enhanced_current_node_feature, _ = self.current_node_decoder2(current_node_feature, enhanced_node_feature, node_padding_mask)
+        # selected_center_feature = selected_center_feature.unsqueeze(1)
+        embedding_current_node_feature = self.current_embedding2(torch.cat((enhanced_current_node_feature, current_node_feature, selected_center_feature), dim=-1))
+        action_logp = self.pointer2(embedding_current_node_feature, neighboring_feature, current_mask)
+        action_logp= action_logp.squeeze(1) # batch_size*k_size
+        action_logp_index = torch.argmax(action_logp, dim=1).long()
+        selected_action_index = current_edge[torch.arange(current_edge.size(0)), action_logp_index, :]
+        selected_action_feature = neighboring_feature[torch.arange(neighboring_feature.size(0)), action_logp_index, :]
+        selected_action_feature = selected_action_feature.unsqueeze(1)       
+        return action_logp, neighboring_feature, selected_action_index, selected_action_feature
 
-        neighboring_feature = torch.gather(enhanced_node_feature, 1,
-                                           current_edge.repeat(1, 1, embedding_dim))
-
-        logp = self.pointer(current_state_feature, neighboring_feature, edge_padding_mask)
-        logp = logp.squeeze(1)
-
-        return logp
-
-    # @torch.compile
-    def forward(self, node_inputs, node_padding_mask, edge_mask, current_index,
-                current_edge, edge_padding_mask):
-        enhanced_node_feature = self.encode_graph(node_inputs, node_padding_mask, edge_mask)
-        current_node_feature, enhanced_current_node_feature = self.decode_state(
-            enhanced_node_feature, current_index, node_padding_mask)
-        logp = self.output_policy(current_node_feature, enhanced_current_node_feature,
-                                  enhanced_node_feature, current_edge, edge_padding_mask)
-
-        return logp
-
+    def forward(self, node_inputs, edge_inputs, current_index, target_index, all_center_index, node_padding_mask=None, edge_padding_mask=None, edge_mask=None, center_mask=None):
+        enhanced_node_feature, enhanced_current_node_feature, selected_center_index, selected_center_feature, center_logp, center_node_features = self.graph_encoder_and_center_decoder(\
+            node_inputs, node_padding_mask, edge_mask, center_mask, all_center_index, target_index, current_index, edge_inputs)
+        action_logp, neighboring_features, selected_action_index, selected_action_feature = self.output_policy(enhanced_node_feature, enhanced_current_node_feature, edge_inputs, edge_padding_mask, selected_center_feature, node_padding_mask)
+        return center_logp, action_logp, \
+            selected_center_index, selected_action_index, \
+            center_node_features, neighboring_features, selected_center_feature, selected_action_feature
 
 class QNet(nn.Module):
-    def __init__(self, node_dim, embedding_dim):
+    def __init__(self, input_dim, embedding_dim):
         super(QNet, self).__init__()
-
-        # graph encoder
-        self.initial_embedding = nn.Linear(node_dim, embedding_dim)
+        self.initial_embedding = nn.Linear(input_dim, embedding_dim) # layer for non-end position
+        self.current_embedding1 = nn.Linear(embedding_dim * 2, embedding_dim)
+        self.current_embedding2 = nn.Linear(embedding_dim * 3, embedding_dim)
         self.encoder = Encoder(embedding_dim=embedding_dim, n_head=8, n_layer=6)
+        self.target_node_decoder = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
+        self.current_node_decoder2 = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
+        self.pointer1 = SingleHeadAttention(embedding_dim)
+        self.pointer2 = SingleHeadAttention(embedding_dim)
+        self.neighbor_embedding = nn.Linear(embedding_dim * 2, embedding_dim)
+        self.q_values_layer1 = nn.Linear(embedding_dim * 2, 1)
+        self.q_values_layer2 = nn.Linear(embedding_dim * 2, 1)
 
-        # decoder
-        self.decoder = Decoder(embedding_dim=embedding_dim, n_head=8, n_layer=1)
-
-        self.q_values_layer = nn.Linear(embedding_dim * 3, 1)
-
-    def encode_graph(self, node_inputs, node_padding_mask, edge_mask):
+    def graph_encoder_and_center_decoder(self, node_inputs, node_padding_mask, edge_mask, optimal_center_index, center_index, target_index, current_index, edge_inputs):
+        # q encoder
         node_feature = self.initial_embedding(node_inputs)
-        enhanced_node_feature = self.encoder(src=node_feature,
-                                             key_padding_mask=node_padding_mask,
-                                             attn_mask=edge_mask)
-
-        return enhanced_node_feature
-
-    def decode_state(self, enhanced_node_feature, current_index, node_padding_mask):
+        enhanced_node_feature = self.encoder(src=node_feature, key_padding_mask=node_padding_mask, attn_mask=edge_mask)
+        # decoder1 - select center
+        center_index = center_index.permute(0, 2, 1)
         embedding_dim = enhanced_node_feature.size()[2]
-        current_node_feature = torch.gather(enhanced_node_feature, 1,
-                                            current_index.repeat(1, 1, embedding_dim))
-        enhanced_current_node_feature, _ = self.decoder(current_node_feature,
-                                                        enhanced_node_feature,
-                                                        node_padding_mask)
-
-        return current_node_feature, enhanced_current_node_feature
-
-    def output_q(self, current_node_feature, enhanced_current_node_feature, enhanced_node_feature,
-                 current_edge, edge_padding_mask):
+        target_node_feature = torch.gather(enhanced_node_feature, 1, target_index.repeat(1, 1, embedding_dim))
+        current_node_feature = torch.gather(enhanced_node_feature, 1, current_index.repeat(1, 1, embedding_dim))
+        center_node_features = torch.gather(enhanced_node_feature, 1, center_index.repeat(1, 1, embedding_dim))
+        enhanced_target_node_feature, attention_weights = self.target_node_decoder(target_node_feature, enhanced_node_feature, node_padding_mask)
+        embedding_target_node_feature = self.current_embedding1(torch.cat((enhanced_target_node_feature, target_node_feature), dim=-1))
+        center_feature = torch.cat((embedding_target_node_feature.repeat(1, LOCAL_K_SIZE, 1), center_node_features), dim=-1) # batch_size*k_size*embedding_dim
+        q_values = self.q_values_layer1(center_feature)
+        selected_center_index = torch.argmax(q_values, dim=1).long()
+        selected_center_node_feature = torch.gather(center_node_features, 1, selected_center_index.unsqueeze(1).repeat(1, 1, embedding_dim))
+        # print("selected_center_node_feature", selected_center_node_feature.size()) # batch_size*1*embedding_dim
+        
+        return q_values, attention_weights, selected_center_index, selected_center_node_feature, enhanced_node_feature, current_node_feature
+    
+    def output_q_values(self, enhanced_node_feature, current_node_feature, edge_inputs, edge_padding_mask, selected_center_feature, node_padding_mask):
+        # q decoder2 - select next move based on the selected center
+        k_size = edge_inputs.size()[2]
+        current_edge = edge_inputs
+        # current_edge = current_edge.permute(0, 2, 1)
         embedding_dim = enhanced_node_feature.size()[2]
-        k_size = current_edge.size()[1]
-        current_state_feature = torch.cat((enhanced_current_node_feature, current_node_feature), dim=-1)
+        neigboring_feature = torch.gather(enhanced_node_feature, 1, current_edge.repeat(1, 1, embedding_dim))
+        enhanced_current_node_feature, attention_weights = self.current_node_decoder2(current_node_feature, enhanced_node_feature, node_padding_mask)
+        embedding_current_node_feature = self.current_embedding2(torch.cat((enhanced_current_node_feature, current_node_feature, selected_center_feature), dim=-1))
+        action_features = torch.cat((embedding_current_node_feature.repeat(1, LOCAL_K_SIZE, 1), neigboring_feature), dim=-1)
+        q_values = self.q_values_layer2(action_features)
 
-        neighboring_feature = torch.gather(enhanced_node_feature, 1,
-                                           current_edge.repeat(1, 1, embedding_dim))
+        # if edge_padding_mask is not None:
+        #     current_mask = edge_padding_mask
+        # else:
+        #     current_mask = None
+        # current_mask[:, :, 0] = 1  # don't stay at current position
+        # #assert 0 in current_mask
+        # current_mask = current_mask.permute(0, 2, 1)
+        # zero = torch.zeros_like(q_values).to(q_values.device)
+        # q_values = torch.where(current_mask == 1, zero, q_values)
 
-        action_features = torch.cat((current_state_feature.repeat(1, k_size, 1), neighboring_feature), dim=-1)
-        q_values = self.q_values_layer(action_features)
-        return q_values
+        return q_values, attention_weights
 
-    def forward(self, node_inputs, node_padding_mask, edge_mask, current_index,
-                current_edge, edge_padding_mask):
-        enhanced_node_feature = self.encode_graph(node_inputs, node_padding_mask, edge_mask)
-        current_node_feature, enhanced_current_node_feature = self.decode_state(enhanced_node_feature, current_index,
-                                                                                node_padding_mask)
-        q_values = self.output_q(current_node_feature, enhanced_current_node_feature,
-                                 enhanced_node_feature, current_edge, edge_padding_mask)
-
-        return q_values
+    def forward(self, node_inputs, edge_inputs, current_index, optimal_center_index, center_index, target_index, node_padding_mask=None, edge_padding_mask=None, edge_mask=None, center_mask=None):
+        centers_q_values, attention_weights1, selected_center_index, selected_center_feature, enhanced_node_feature, current_node_feature  = self.graph_encoder_and_center_decoder(\
+            node_inputs, node_padding_mask, edge_mask, optimal_center_index, center_index, target_index, current_index, edge_inputs)
+        action_q_values, attention_weights2 = self.output_q_values(enhanced_node_feature, current_node_feature, edge_inputs, edge_padding_mask, selected_center_feature, node_padding_mask)
+        return centers_q_values, attention_weights1, \
+            action_q_values, attention_weights2
